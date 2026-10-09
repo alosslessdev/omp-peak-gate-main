@@ -1,19 +1,40 @@
 # omp-peak-gate
 
-Pause every oh-my-pi LLM call while DeepSeek's peak-pricing window is open.
+Park remote DeepSeek LLM calls while DeepSeek's peak-pricing window is open —
+with opt-in fallback to your configured next model.
 
-DeepSeek bills full rate Mon–Fri **01:00–04:00** and **06:00–10:00 UTC**. This plugin
-freezes the whole process at those boundaries by engaging the same process-global
-`agentPauseGate` the TUI `/pause` command uses, so:
+DeepSeek bills full rate Mon–Fri **01:00–04:00** and **06:00–10:00 UTC**. This
+plugin engages the same process-global `agentPauseGate` the TUI `/pause` command
+uses at those boundaries, so:
 
 - in-flight provider streams finish (already billed),
 - no new model call starts while the window is open,
 - every agent loop **parks** instead of aborting — queued prompts and steering
   messages deliver normally once the window closes.
 
-The decision is a pure function of the wall clock and a static window table, so
-suspend/resume, clock jumps and timer jitter cannot drift it. An exact edge timer
-engages/releases at the boundary; a 30-second heartbeat re-derives state.
+**Scope: only remote DeepSeek models.** The gate engages only when the session's
+current model has `deepseek` in its provider, model id or name **and** is served
+off this machine. Everything else keeps running during the window:
+
+- other models (Claude, GPT, your default model, …) — never gated,
+- DeepSeek checkpoints running locally — Ollama, llama.cpp, LM Studio, vLLM and
+  friends (loopback `baseUrl` or a known local provider id) — never gated, they
+  are not billed at DeepSeek peak rates.
+
+`/peak-gate pause` still pauses every model regardless of scope.
+
+**Fallback (opt-in).** If the gated model has an entry in oh-my-pi's own
+`retry.fallbackChains` settings, the session switches to the next usable model
+at the window's start instead of parking, and switches back when the window
+closes. No chain configured → the gate parks as before; there is nothing to set
+in this plugin. Candidates that are themselves remote DeepSeek models are
+skipped (they would not escape peak pricing); a local DeepSeek checkpoint in the
+chain is a valid, free target.
+
+The gate decision is a pure function of the wall clock, the session model and a
+static window table, so suspend/resume, clock jumps and timer jitter cannot
+drift it. An exact edge timer engages/releases at the boundary; a 30-second
+heartbeat re-derives state (and notices model changes).
 
 ## Install
 
@@ -41,12 +62,15 @@ load, and the gate would be registered twice.
 
 | Command                                  | Effect                                                   |
 | ---------------------------------------- | -------------------------------------------------------- |
-| `/peak-gate`                             | Show state, windows, current period, next boundary        |
+| `/peak-gate`                             | Show state, windows, model scope, fallback, next boundary |
 | `/peak-gate pause`                       | Hold LLM calls paused until the next window boundary      |
-| `/peak-gate resume`                      | Release now, skip the current window (until its boundary) |
+| `/peak-gate resume`                      | Release now, skip the current window (restore a fallback) |
 | `/peak-gate reload`                      | Re-read the config file and re-arm the timers             |
 
-While the gate is held, the status line shows `⏸ peak-gate until <UTC>`.
+While the gate is held, the status line shows `⏸ peak-gate until <UTC>`; while
+running on a fallback model it shows `⏸ peak-gate ↓<model> until <UTC>`.
+`pause` pauses every model regardless of scope; `resume` releases the gate and
+switches back to the original DeepSeek model if a fallback was applied.
 
 ## Configuration
 
@@ -67,6 +91,26 @@ While the gate is held, the status line shows `⏸ peak-gate until <UTC>`.
 - `weekdays` uses `Date#getUTCDay` numbering (0 = Sunday). Omit it for daily.
 - `{ "enabled": false }` disables the plugin without uninstalling it.
 
+### Fallback (opt-in, configured in omp itself)
+
+Fallback uses oh-my-pi's standard `retry.fallbackChains` — nothing plugin-side
+to configure. In `~/.omp/agent/config.yml` (or project `.omp/config.yml`):
+
+```yaml
+retry:
+  fallbackChains:
+    deepseek/deepseek-v4-flash:
+      - xiaomi/mimo-v2.6-flash:high
+      - anthropic/claude-sonnet-4
+    default:
+      - ollama/qwen3:8b
+```
+
+At the window's start the gated model's chain is walked (same resolution core
+uses on provider errors: exact model key, provider wildcard, model role, then
+`default`) and the first usable non-remote-DeepSeek model takes over. Without
+an entry the gate parks instead — fallback stays opt-in.
+
 Environment overrides:
 
 | Variable                     | Effect                                                            |
@@ -81,7 +125,10 @@ Environment overrides:
 
 Gated (the gate is polled before each model call and each tool call): the main
 agent, in-process subagents, advisors, tool loops — i.e. everything that spends
-through an agent loop.
+through an agent loop — **but only while the session model is a remote DeepSeek
+model** (see scope above). The gate itself is process-global: a session parked
+on DeepSeek holds every loop in the process until the window closes or the
+fallback switch releases it.
 
 Not gated: a few side channels stream outside any agent loop (`/btw` side turns,
 session title generation, remote compaction). `before_provider_request` cannot
@@ -89,8 +136,9 @@ veto them — that hook may only replace the payload and a thrown error is
 swallowed — so they are surfaced as a throttled warning instead of being billed
 silently. Use `OMP_PEAK_GATE_QUIET=1` to silence it.
 
-The gate pauses **all** models during a window, not only DeepSeek ones. Narrow it
-by editing `windows`, or disable it and rely on `/peak-gate pause` manually.
+Never gated: non-DeepSeek models and locally served models — they do not match
+the scope, so no window can pause them. To pause everything manually, use
+`/peak-gate pause`; to change when the window applies, edit `windows`.
 
 ## Layout
 

@@ -1,11 +1,11 @@
 {
   "name": "omp-peak-gate",
-  "version": "0.1.0",
-  "description": "Pause every oh-my-pi LLM call during DeepSeek's peak-pricing windows",
+  "version": "0.2.0",
+  "description": "Gate remote DeepSeek LLM calls during DeepSeek's peak-pricing windows, with opt-in fallback via retry.fallbackChains",
   "type": "module",
-  "keywords": ["omp", "oh-my-pi", "plugin", "extension", "deepseek", "cost", "peak", "pause"],
+  "keywords": ["omp", "oh-my-pi", "plugin", "extension", "deepseek", "cost", "peak", "pause", "fallback"],
   "omp": {
-    "description": "Pause every oh-my-pi LLM call during DeepSeek's peak-pricing windows",
+    "description": "Gate remote DeepSeek LLM calls during DeepSeek's peak-pricing windows, with opt-in fallback via retry.fallbackChains",
     "extensions": ["./extensions/peak-gate.ts"]
   }
 }
