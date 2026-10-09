@@ -4,15 +4,32 @@
  * DeepSeek bills peak rates during 01:00-04:00 and 06:00-10:00 UTC, Monday
  * through Friday (the same schedule the catalog marks on `deepseek` models,
  * which is what the `↑`/`↓` indicator in the cost display reads). While a peak
- * window is active this extension refuses to start new model calls process
- * wide by engaging the process-global `agentPauseGate` — the same gate the TUI
- * `/pause` command drives. Every agent loop in the process polls that gate
- * before each model call and before each tool call, so:
+ * window is active and the session's current model is a **remote DeepSeek
+ * model** this extension refuses to start new model calls by engaging the
+ * process-global `agentPauseGate` — the same gate the TUI `/pause` command
+ * drives. Every agent loop in the process polls that gate before each model
+ * call and before each tool call, so:
  *
  *   - in-flight provider streams finish (they were already billed),
  *   - nothing new is dispatched while the window is open,
  *   - every loop parks instead of aborting, so queued messages deliver
  *     normally when the window closes.
+ *
+ * Scope: the gate engages only for models whose provider, provider type, id or
+ * name contains "deepseek" **and** that are served off this machine. DeepSeek
+ * checkpoints running locally (Ollama, llama.cpp, LM Studio, … — loopback
+ * baseUrl or a known local provider id) are never gated: they are not billed
+ * at DeepSeek's peak rates. Any other model (Claude, GPT, local models) is
+ * never gated either. `manual === "pause"` (`/peak-gate pause`) still pauses
+ * everything regardless of model.
+ *
+ * Fallback (opt-in): if the model IS gated and oh-my-pi has a fallback chain
+ * configured for it (`retry.fallbackChains` in omp settings — the same chain
+ * core walks on provider errors), the session switches to the next usable
+ * model instead of parking, then switches back when the window closes. No
+ * chain configured (or every candidate is itself a remote DeepSeek model) →
+ * the gate parks calls as before. This is opt-in purely through omp's own
+ * fallback configuration; the plugin adds no settings of its own.
  *
  * A few side channels stream outside any agent loop (`/btw` side turns, session
  * title generation, remote compaction). Those cannot be parked here and cannot
@@ -20,11 +37,11 @@
  * payload, and a thrown error is swallowed — so they are warned about rather
  * than blocked.
  *
- * The decision is a pure function of the wall clock and a static window table:
- * state = f(now), never f(elapsed timers), so suspend/resume, clock jumps and
- * timer jitter cannot drift it. A precise edge timer engages/releases at the
- * boundary; a slow heartbeat re-derives state in case the process slept
- * through the edge.
+ * The decision is a pure function of the wall clock, the session model and a
+ * static window table: state = f(now, model), never f(elapsed timers), so
+ * suspend/resume, clock jumps and timer jitter cannot drift it. A precise edge
+ * timer engages/releases at the boundary; a slow heartbeat re-derives state in
+ * case the process slept through the edge or the model changed.
  *
  * Config:
  *   - `~/.omp/agent/peak-gate.json`  optional override, `{ "windows": [...] }`
@@ -37,6 +54,7 @@
  *   - `OMP_PEAK_GATE_KEEPALIVE=0`    let a parked headless run exit instead of
  *                                    holding the process open until the window closes.
  *   - `OMP_PEAK_GATE_DEBUG=/path`    append decision lines to a log file.
+ *   - fallback: `retry.fallbackChains` in omp settings (see above) — opt-in.
  *
  * Manual control: `/peak-gate status|pause|resume|reload`. A manual override
  * lasts until the next window boundary.
@@ -47,8 +65,15 @@
  * `{ "enabled": false }` in the config file above.
  */
 import { appendFileSync, readFileSync } from "node:fs";
-import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
+import { agentPauseGate, type ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import {
+	findRetryFallbackCandidates,
+	formatRetryFallbackSelector,
+	getRetryFallbackChains,
+	resolveRetryFallbackChainKey,
+} from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
+import type { Model } from "@oh-my-pi/pi-ai";
 
 const DAY_MS = 86_400_000;
 const MINUTE_MS = 60_000;
@@ -56,6 +81,23 @@ const CONFIG_PATH = `${process.env.PI_CODING_AGENT_DIR ?? `${process.env.HOME}/.
 const HEARTBEAT_MS = 30_000;
 const NOTIFY_COOLDOWN_MS = 60_000;
 const WEEKDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
+
+/**
+ * Provider ids that execute on the local machine even when their baseUrl is
+ * not loopback (custom endpoints, port-forwarded daemons). `ollama-cloud` is
+ * deliberately absent — it is a remote service.
+ */
+const LOCAL_PROVIDERS: Readonly<Record<string, true>> = {
+	ollama: true,
+	"llama.cpp": true,
+	llamacpp: true,
+	"lm-studio": true,
+	lmstudio: true,
+	local: true,
+	vllm: true,
+	koboldcpp: true,
+	localai: true,
+};
 
 /** One recurring peak-pricing window, expressed in UTC minute-of-day. */
 interface PeakWindow {
@@ -65,6 +107,13 @@ interface PeakWindow {
 	startMinute: number;
 	/** Exclusive end, minute of day (1-1440); must exceed the start. */
 	endMinute: number;
+}
+
+/** A fallback candidate resolved from `retry.fallbackChains`. */
+interface FallbackTarget {
+	model: Model;
+	/** Thinking level the chain entry requested (`provider/id:level`), if any. */
+	thinkingLevel: ThinkingLevel | undefined;
 }
 
 /** DeepSeek published peak pricing: Mon-Fri 01:00-04:00 and 06:00-10:00 UTC. */
@@ -149,6 +198,52 @@ function describeWindows(windows: readonly PeakWindow[]): string {
 	return groups.map(group => `${group.label} ${group.ranges.join(", ")}`).join(" · ") + " UTC";
 }
 
+/** `provider/model-id` label for notifications and status output. */
+function modelLabel(model: Model | undefined): string {
+	return model === undefined ? "no model" : `${model.provider}/${model.id}`;
+}
+
+/** True when the model's provider, discovery backend, id or name says "deepseek". */
+function matchesDeepseek(model: Model): boolean {
+	return `${model.provider} ${model.providerType ?? ""} ${model.id} ${model.name}`.toLowerCase().includes("deepseek");
+}
+
+/** True when a baseUrl points at this machine (localhost / 127.0.0.0/8 / ::1). */
+function isLoopbackBaseUrl(baseUrl: string): boolean {
+	try {
+		let host = new URL(baseUrl).hostname.toLowerCase();
+		if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
+		return host === "localhost" || host === "::1" || host === "0.0.0.0" || host.startsWith("127.");
+	} catch {
+		// Custom providers can register odd baseUrls; fall back to a substring check.
+		const lower = baseUrl.toLowerCase();
+		return lower.includes("localhost") || lower.includes("127.0.0.1");
+	}
+}
+
+/** True when the model executes on this machine (Ollama, llama.cpp, …). */
+function isLocalModel(model: Model): boolean {
+	if (isLoopbackBaseUrl(model.baseUrl)) return true;
+	const provider = model.provider.toLowerCase();
+	if (LOCAL_PROVIDERS[provider] === true) return true;
+	return model.providerType !== undefined && LOCAL_PROVIDERS[model.providerType.toLowerCase()] === true;
+}
+
+/**
+ * The only models the gate touches automatically: DeepSeek-named and billed
+ * through a remote endpoint. A DeepSeek checkpoint served by Ollama or
+ * llama.cpp on this machine is local → not gated.
+ */
+function isGatedModel(model: Model): boolean {
+	return matchesDeepseek(model) && !isLocalModel(model);
+}
+
+/** Why a model is out of the gate's scope, for `/peak-gate status`. */
+function gatedReason(model: Model): string {
+	if (!matchesDeepseek(model)) return `no "deepseek" in provider/model name (${modelLabel(model)})`;
+	return `served locally via ${model.provider} - not billed at DeepSeek peak rates`;
+}
+
 /** Validate one parsed window entry; returns undefined for anything malformed. */
 function parseWindow(value: unknown): PeakWindow | undefined {
 	if (typeof value !== "object" || value === null) return undefined;
@@ -209,6 +304,8 @@ function loadWindows(): { windows: readonly PeakWindow[]; enabled: boolean; sour
 /**
  * Extension factory. `agentPauseGate` is a process-global singleton shared with
  * the TUI `/pause` command, main agents, in-process subagents, and advisors.
+ * Each session (main and subagents) gets its own factory binding, so model
+ * state below is per session while the gate itself stays process-wide.
  */
 export default function deepseekPeakGate(pi: ExtensionAPI) {
 	let { windows, enabled, source } = loadWindows();
@@ -228,6 +325,14 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 	 */
 	let keepalive: Timer | undefined;
 	let lastNotifyAt = 0;
+	/** Set while we hold a fallback switch made this window, for the restore. */
+	let switched:
+		| { original: Model; originalThinking: ThinkingLevel | undefined; thinkingChanged: boolean; target: Model }
+		| undefined;
+	/** True while `pi.setModel` is in flight. */
+	let switchInFlight = false;
+	/** Set when a switch was attempted and refused this window; retried on reload/window end. */
+	let switchFailed = false;
 
 	/** Keep a parked headless process alive; release it with the gate. */
 	const holdProcess = (engaged: boolean): void => {
@@ -240,16 +345,137 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 		}
 	};
 
+	/**
+	 * Resolve the next usable model from omp's `retry.fallbackChains` for
+	 * `model`. Returns undefined when no chain is configured (fallback is
+	 * opt-in) or when every candidate is itself a remote DeepSeek model, which
+	 * would not escape peak pricing. Throws are absorbed: a missing settings
+	 * singleton simply means "not configured".
+	 */
+	const resolveFallbackTarget = (model: Model): FallbackTarget | undefined => {
+		const registry = context?.modelRegistry;
+		if (registry === undefined) return undefined;
+		try {
+			const chains = getRetryFallbackChains(pi.pi.settings);
+			const modelLookup = {
+				find: (provider: string, id: string): Model | undefined => registry.find(provider, id),
+				hasProvider: (provider: string): boolean => registry.hasProvider(provider),
+			};
+			const resolution = {
+				chains,
+				getModelRole: (role: string): string | undefined => pi.pi.settings.getModelRole(role),
+				modelLookup,
+			};
+			const selector = formatRetryFallbackSelector(model, pi.getThinkingLevel());
+			const chainKey = resolveRetryFallbackChainKey(resolution, selector, model);
+			if (chainKey === undefined) return undefined;
+			for (const candidate of findRetryFallbackCandidates(resolution, chainKey, selector, model)) {
+				const target = modelLookup.find(candidate.provider, candidate.id);
+				if (target === undefined) continue;
+				if (isGatedModel(target)) continue; // still peak-billed DeepSeek
+				return { model: target, thinkingLevel: candidate.thinkingLevel };
+			}
+			return undefined;
+		} catch (error) {
+			debug(`fallback: retry.fallbackChains unavailable: ${String(error)}`);
+			return undefined;
+		}
+	};
+
+	/**
+	 * Switch the session to its configured fallback model. Called only while
+	 * the gate is already engaged, so no DeepSeek call can start while the
+	 * async switch is in flight; a successful switch releases the gate through
+	 * its own `apply`, a refusal keeps it parked.
+	 */
+	const startFallback = (model: Model): void => {
+		if (switched !== undefined || switchInFlight || switchFailed) return;
+		const target = resolveFallbackTarget(model);
+		if (target === undefined) {
+			// Not configured (or only remote DeepSeek candidates): park.
+			debug(`fallback: no usable retry.fallbackChains entry for ${modelLabel(model)}; staying paused`);
+			return;
+		}
+		switchInFlight = true;
+		const original = model;
+		const originalThinking = pi.getThinkingLevel();
+		void (async () => {
+			try {
+				const ok = await pi.setModel(target.model);
+				if (!ok) {
+					switchFailed = true;
+					debug(`fallback: setModel(${modelLabel(target.model)}) refused (missing API key?); staying paused`);
+					context?.ui.notify(
+						`DeepSeek peak window: fallback model ${modelLabel(target.model)} is unusable; calls stay paused`,
+						"warning",
+					);
+					return;
+				}
+				const thinkingChanged =
+					target.thinkingLevel !== undefined && target.thinkingLevel !== originalThinking;
+				if (thinkingChanged && target.thinkingLevel !== undefined) pi.setThinkingLevel(target.thinkingLevel);
+				switched = { original, originalThinking, thinkingChanged, target: target.model };
+				switchFailed = false;
+				debug(`fallback: switched ${modelLabel(original)} -> ${modelLabel(target.model)} (retry.fallbackChains)`);
+				context?.ui.notify(
+					`DeepSeek peak window: using fallback ${modelLabel(target.model)} (retry.fallbackChains)`,
+					"info",
+				);
+				apply(Date.now());
+			} catch (error) {
+				switchFailed = true;
+				debug(`fallback: setModel threw: ${String(error)}`);
+			} finally {
+				switchInFlight = false;
+			}
+		})();
+	};
+
+	/** Undo a fallback switch once the window is over (or the user opted out). */
+	const restoreIfSwitched = (): void => {
+		if (switched === undefined) return;
+		const { original, originalThinking, thinkingChanged, target } = switched;
+		switched = undefined;
+		if (context?.model !== target) {
+			// The user picked another model while we were on fallback; leave it alone.
+			debug("fallback: model changed elsewhere; skipping restore");
+			return;
+		}
+		void pi
+			.setModel(original)
+			.then(ok => {
+				if (!ok) {
+					debug(`fallback: restore of ${modelLabel(original)} refused`);
+					return;
+				}
+				if (thinkingChanged && originalThinking !== undefined) pi.setThinkingLevel(originalThinking);
+				debug(`fallback: restored ${modelLabel(original)}`);
+				context?.ui.notify(`Peak window over: restored ${modelLabel(original)}`, "info");
+			})
+			.catch(error => debug(`fallback: restore threw: ${String(error)}`));
+	};
+
+	/** Pause decision for a point in time: clock, manual override, session model. */
 	const shouldPause = (now: number): boolean => {
 		if (!enabled) return false;
 		if (manual === "pause") return true;
 		if (manual === "resume") return false;
-		return isPeak(windows, now);
+		if (!isPeak(windows, now)) return false;
+		const model = context?.model;
+		return model !== undefined && isGatedModel(model);
 	};
 
-	/** Reconcile the gate with the clock. Idempotent; safe to call at any time. */
+	/** Reconcile the gate with the clock and the session model. Idempotent. */
 	const apply = (now: number): void => {
-		const want = shouldPause(now);
+		const inWindow = enabled && (manual === "pause" ? true : manual === "resume" ? false : isPeak(windows, now));
+		const model = context?.model;
+		const gated = model !== undefined && isGatedModel(model);
+
+		// Out of the window (or manual resume): hand the session back first so
+		// the gate decision below sees the restored DeepSeek model.
+		if (!inWindow && switched !== undefined) restoreIfSwitched();
+
+		const want = inWindow && (manual === "pause" || gated);
 		const wasHolding = holding;
 		if (want && !agentPauseGate.paused) {
 			// pause() reports false when someone else (the user, /pause) holds it.
@@ -262,19 +488,46 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 		}
 		holdProcess(holding);
 
+		// While gated inside a window, hand off to the configured fallback model.
+		if (inWindow && manual !== "pause" && gated && switched === undefined) startFallback(model as Model);
+
 		const next = nextTransition(windows, now);
 		const until = next === undefined ? "" : ` until ${utcLabel(next)}`;
-		context?.ui.setStatus("peak-gate", holding ? `⏸ peak-gate${until}` : undefined);
+		let status: string | undefined;
+		if (holding) status = `⏸ peak-gate${until}`;
+		else if (switched !== undefined) status = `⏸ peak-gate ↓${context?.model?.id ?? "fallback"}${until}`;
+		context?.ui.setStatus("peak-gate", status);
 		debug(
-			`apply: want=${want} holding=${holding} wasHolding=${wasHolding} gate=${agentPauseGate.paused} next=${next === undefined ? "none" : utcLabel(next)} windows=${describeWindows(windows)}`,
+			`apply: want=${want} holding=${holding} wasHolding=${wasHolding} gate=${agentPauseGate.paused} model=${modelLabel(model)} gated=${gated} switched=${switched === undefined ? "no" : modelLabel(switched.target)} next=${next === undefined ? "none" : utcLabel(next)} windows=${describeWindows(windows)}`,
 		);
 		if (holding === wasHolding) return;
 		if (holding) {
 			const release = next === undefined ? "" : `; releases ${utcLabel(next)}`;
-			context?.ui.notify(`DeepSeek peak window (${describeWindows(windows)}): LLM calls paused${release}`, "info");
-		} else {
-			context?.ui.notify("LLM calls resumed (outside the DeepSeek peak window)", "info");
+			if (manual === "pause") {
+				context?.ui.notify(`Peak gate: LLM calls paused manually${release}`, "info");
+			} else {
+				const fallback = model !== undefined ? resolveFallbackTarget(model) : undefined;
+				const fallbackNote =
+					fallback === undefined
+						? "; no fallback configured in retry.fallbackChains"
+						: `; will use ${modelLabel(fallback.model)} (retry.fallbackChains)`;
+				context?.ui.notify(
+					`DeepSeek peak window (${describeWindows(windows)}) for ${modelLabel(model)}: LLM calls paused${release}${fallback === undefined ? fallbackNote : ""}`,
+					"info",
+				);
+			}
+		} else if (switched === undefined) {
+			const why = !enabled
+				? "disabled"
+				: manual === "resume"
+					? "resumed manually"
+					: isPeak(windows, now)
+						? "no remote DeepSeek model active"
+						: "outside the DeepSeek peak window";
+			context?.ui.notify(`LLM calls resumed (${why})`, "info");
 		}
+		// A release caused by a successful fallback switch is announced by
+		// startFallback itself, so no generic resume message here.
 	};
 
 	/** Arm the precise edge timer plus the heartbeat re-derivation. */
@@ -304,14 +557,18 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => arm(ctx));
 	pi.on("session_shutdown", () => holdProcess(false));
+	// Re-derive at run start so a model change (or a window that opened while
+	// idle) takes effect on the next call instead of waiting out the heartbeat.
+	pi.on("agent_start", () => apply(Date.now()));
 
 	// Advisory slip detector. The gate parks every agent loop before its model
-	// call, so a request that reaches this hook while a window is open came from
-	// a path the gate cannot park (`/btw`, title generation, remote compaction).
-	// This hook cannot refuse it: returning a payload is the only lever, and a
-	// thrown error is swallowed by the runner. Warn (throttled) so a billed call
-	// during a pause is visible instead of silent — and never abort the session,
-	// which would not stop the request it was reacting to.
+	// call, so a request that reaches this hook while the gate should be closed
+	// on this model came from a path the gate cannot park (`/btw`, title
+	// generation, remote compaction). This hook cannot refuse it: returning a
+	// payload is the only lever, and a thrown error is swallowed by the runner.
+	// Warn (throttled) so a billed call during a pause is visible instead of
+	// silent — and never abort the session, which would not stop the request it
+	// was reacting to.
 	pi.on("before_provider_request", (_event, ctx) => {
 		if (!enabled || quiet) return;
 		const now = Date.now();
@@ -319,7 +576,7 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 		lastNotifyAt = now;
 		debug("slip: a non-parked provider request reached the wire during a window");
 		ctx.ui.notify(
-			`A provider request ran during the DeepSeek peak window (${describeWindows(windows)}); the gate covers agent-loop calls only`,
+			`A provider request ran during the DeepSeek peak window (${describeWindows(windows)}) for ${modelLabel(context?.model)}; the gate covers agent-loop calls only`,
 			"warning",
 		);
 	});
@@ -345,17 +602,37 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 					enabled = loaded.enabled;
 					source = loaded.source;
 					manual = undefined;
+					switchFailed = false;
 					arm(ctx);
 					ctx.ui.notify(`Peak gate reloaded from ${source}: ${describeWindows(windows)}`, "info");
 					break;
 				}
 				default: {
 					const next = nextTransition(windows, now);
+					const model = ctx.model;
+					const modelLine =
+						model === undefined
+							? "none (no model set)"
+							: isGatedModel(model)
+								? `${modelLabel(model)} - GATED (remote DeepSeek)`
+								: `not gated - ${gatedReason(model)}`;
+					let fallbackLine: string;
+					if (switched !== undefined) {
+						fallbackLine = `applied: ${modelLabel(switched.original)} -> ${modelLabel(switched.target)}`;
+					} else {
+						const target = model !== undefined && isGatedModel(model) ? resolveFallbackTarget(model) : undefined;
+						fallbackLine =
+							target === undefined
+								? "not configured (retry.fallbackChains)"
+								: `configured: ${modelLabel(target.model)}`;
+					}
 					ctx.ui.notify(
 						[
 							`peak gate: ${enabled ? "enabled" : "disabled (OMP_PEAK_GATE=off or config)"}`,
 							`windows: ${describeWindows(windows)} (${source})`,
-							`now: ${isPeak(windows, now) ? "PEAK - LLM calls paused" : "off-peak"}`,
+							`model: ${modelLine}`,
+							`fallback: ${fallbackLine}`,
+							`now: ${isPeak(windows, now) ? "PEAK window" : "off-peak"}${shouldPause(now) ? " - LLM calls paused" : ""}`,
 							`gate: ${agentPauseGate.paused ? (holding ? "engaged by peak-gate" : "engaged elsewhere (/pause)") : "open"}`,
 							`next boundary: ${next === undefined ? "none" : utcLabel(next)}`,
 						].join("\n"),
