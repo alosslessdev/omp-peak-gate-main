@@ -1,0 +1,64 @@
+{
+  "format": "omp-session-archive/v1",
+  "generatedAt": "2026-10-09T06:05:46.995Z",
+  "source": {
+    "sessionFile": "/home/asdf/.omp/agent/sessions/-projects/2026-09-28T22-18-32-579Z_01a0ea19-2903-76e9-8058-f6c2eab80f3a.jsonl",
+    "sessionId": "01a0ea19-2903-76e9-8058-f6c2eab80f3a",
+    "cwd": "/tmp",
+    "title": "Pause LLM calls at 9"
+  },
+  "main": {
+    "entries": 638,
+    "bytes": 3005743
+  },
+  "subagents": [],
+  "artifacts": [],
+  "agents": {
+    "count": 1,
+    "agents": [
+      {
+        "id": "Main",
+        "name": "main",
+        "kind": "main",
+        "depth": 0,
+        "model": "deepseek/deepseek-flash",
+        "hasSystemPrompt": true,
+        "ended": false
+      }
+    ]
+  },
+  "jobs": {
+    "liveAgents": [
+      "Main"
+    ],
+    "completed": 3,
+    "completedJobs": [
+      {
+        "agent": "main",
+        "entryId": "1c9d7267",
+        "at": "2026-09-28T22:22:31.355Z",
+        "label": "bg_21",
+        "status": "completed"
+      },
+      {
+        "agent": "main",
+        "entryId": "06861a33",
+        "at": "2026-09-29T03:17:20.941Z",
+        "label": "bg_31",
+        "status": "completed"
+      },
+      {
+        "agent": "main",
+        "entryId": "ad16dd12",
+        "at": "2026-09-29T03:23:13.462Z",
+        "label": "bg_36",
+        "status": "completed"
+      }
+    ]
+  },
+  "totals": {
+    "files": 6,
+    "bytes": 7577335
+  },
+  "omitted": []
+}
