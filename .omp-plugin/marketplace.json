@@ -1,0 +1,21 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "omp-peak-gate",
+  "owner": {
+    "name": "asdf"
+  },
+  "metadata": {
+    "description": "Cost-control plugins for oh-my-pi",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "peak-gate",
+      "source": "./",
+      "description": "Pause every oh-my-pi LLM call during DeepSeek's peak-pricing windows (Mon-Fri 01:00-04:00 and 06:00-10:00 UTC)",
+      "version": "0.1.0",
+      "category": "productivity",
+      "keywords": ["deepseek", "cost", "peak", "pause"]
+    }
+  ]
+}

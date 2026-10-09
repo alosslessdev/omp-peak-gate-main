@@ -1,0 +1,11 @@
+{
+  "name": "omp-peak-gate",
+  "version": "0.1.0",
+  "description": "Pause every oh-my-pi LLM call during DeepSeek's peak-pricing windows",
+  "type": "module",
+  "keywords": ["omp", "oh-my-pi", "plugin", "extension", "deepseek", "cost", "peak", "pause"],
+  "omp": {
+    "description": "Pause every oh-my-pi LLM call during DeepSeek's peak-pricing windows",
+    "extensions": ["./extensions/peak-gate.ts"]
+  }
+}
