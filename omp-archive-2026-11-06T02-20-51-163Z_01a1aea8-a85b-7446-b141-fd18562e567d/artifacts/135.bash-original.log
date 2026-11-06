@@ -1,0 +1,78 @@
+diff --git a/README.md b/README.md
+index 04dabaf..8914e03 100644
+--- a/README.md
++++ b/README.md
+@@ -36,6 +36,33 @@ static window table, so suspend/resume, clock jumps and timer jitter cannot
+ drift it. An exact edge timer engages/releases at the boundary; a 30-second
+ heartbeat re-derives state (and notices model changes).
+ 
++Windows are a static weekly UTC table. There is deliberately **no holiday
++calendar** — the subjectively-set, yearly Chinese holiday dates are not modeled.
++Every weekday listed in the table is subject to the gate.
++
++## Resuming after the pause
++
++Parking only works while a loop is alive. A run can end while the gate holds it,
++and then nothing is left to wake when the gate opens. The plugin therefore
++covers the omp edge cases around that:
++
++| Situation | What happens |
++| --- | --- |
++| Loop parked at a model/tool boundary | `agentPauseGate.resume()` wakes it; no prompt is injected (a live loop makes the check a no-op). |
++| Run aborted while parked (host timeout, deadline, provider abort) | One continuation prompt is sent when the gate opens and the session is idle. |
++| `wait` tool timed out or returned during the pause | The tool result wakes the loop; if the loop already settled, the aborted-run path above sends the prompt. |
++| Gate released manually while an interruptible `wait` is still in flight | After a hold of at least 5s, the plugin sends an `aside` message that ends the wait, so the turn returns to the model instead of sitting out the 30-minute cap. |
++| Steer/follow-up queued while an idle session was paused | The queue never starts a turn by itself; the plugin starts one on release so the queued batch drains. |
++| Process died mid-park, or a host deadline (`--max-time`) disposed the session before the gate opened | A per-session marker (`~/.omp/agent/peak-gate-resume.json`, 24h TTL) causes one continuation prompt when that session is next resumed. Cleared on an ordinary graceful shutdown, kept when a resume is pending. |
++| User pressed Esc / deliberately interrupted | Never auto-resumed; a user-interrupt abort is distinguished from a host/deadline abort. |
++| Fallback model took over | The gate only pauses briefly (or not at all); no resume prompt is generated. |
++
++Auto-resume is bounded to two injections per hold, never runs in subagent
++sessions, and can be disabled entirely with `OMP_PEAK_GATE_RESUME=0`. The
++injected prompt is attributed to the agent, not the user. `/peak-gate status`
++shows whether a run is live, whether it observed a pause, whether a `wait` is
++active, and whether a resume is armed.
++
+ ## Install
+ 
+ ```bash
+@@ -119,6 +146,7 @@ Environment overrides:
+ | `OMP_PEAK_GATE_WINDOWS=JSON` | Replace the window table (`[{"startMinute":60,"endMinute":240}]`) |
+ | `OMP_PEAK_GATE_QUIET=1`      | Suppress the "a call slipped through" warning                     |
+ | `OMP_PEAK_GATE_KEEPALIVE=0`  | Let a parked headless run exit instead of waiting out the window  |
++| `OMP_PEAK_GATE_RESUME=0`     | Disable auto-resume (prompt injection, wait interrupt, restart marker) |
+ | `OMP_PEAK_GATE_DEBUG=/path`  | Append decision lines to a log file                               |
+ 
+ ## What is and is not gated
+@@ -134,16 +162,30 @@ Not gated: a few side channels stream outside any agent loop (`/btw` side turns,
+ session title generation, remote compaction). `before_provider_request` cannot
+ veto them — that hook may only replace the payload and a thrown error is
+ swallowed — so they are surfaced as a throttled warning instead of being billed
+-silently. Use `OMP_PEAK_GATE_QUIET=1` to silence it.
++silently. Use `OMP_PEAK_GATE_QUIET=1` to silence it. Cache warming is stopped
++for the duration of a hold (`cache_warming_decision` → `stop`), since it is a
++replay outside the loop; it resumes on the next real request.
+ 
+ Never gated: non-DeepSeek models and locally served models — they do not match
+ the scope, so no window can pause them. To pause everything manually, use
+ `/peak-gate pause`; to change when the window applies, edit `windows`.
+ 
++## Tests
++
++```bash
++bun test
++```
++
++`test/peak-gate.test.ts` loads the real extension against a mocked omp runtime
++(fake clock, timers, pause gate and session context) and covers the resume
++watchdog, wait interruption, gate ownership across sessions, and the restart
++marker.
++
+ ## Layout
+ 
+ ```
+ package.json                     omp.extensions -> ./extensions/peak-gate.ts
+ extensions/peak-gate.ts          the extension module
++test/peak-gate.test.ts           deterministic edge-case tests (bun test)
+ .omp-plugin/marketplace.json     catalog so the repo is its own marketplace
+ ```

@@ -1,0 +1,70 @@
+{
+  "format": "omp-session-archive/v1",
+  "generatedAt": "2026-11-06T03:02:16.498Z",
+  "source": {
+    "sessionFile": "/home/user/.omp/agent/sessions/-Downloads/2026-11-06T02-20-51-163Z_01a1aea8-a85b-7446-b141-fd18562e567d.jsonl",
+    "sessionId": "01a1aea8-a85b-7446-b141-fd18562e567d",
+    "cwd": "/home/user/Downloads",
+    "title": "Handle oh-my-pi edge cases for session resumption"
+  },
+  "main": {
+    "entries": 671,
+    "bytes": 2124376
+  },
+  "subagents": [],
+  "artifacts": [
+    {
+      "file": "artifacts/2.bash-original.log",
+      "bytes": 15870
+    },
+    {
+      "file": "artifacts/135.bash-original.log",
+      "bytes": 4654
+    },
+    {
+      "file": "artifacts/31.bash.log",
+      "bytes": 60779
+    }
+  ],
+  "agents": {
+    "count": 1,
+    "agents": [
+      {
+        "id": "Main",
+        "name": "main",
+        "kind": "main",
+        "depth": 0,
+        "model": "opencode-go/deepseek-v4.1-flash",
+        "hasSystemPrompt": true,
+        "ended": false
+      }
+    ]
+  },
+  "jobs": {
+    "liveAgents": [
+      "Main"
+    ],
+    "completed": 2,
+    "completedJobs": [
+      {
+        "agent": "main",
+        "entryId": "e47fda33",
+        "at": "2026-11-06T02:27:08.949Z",
+        "label": "bg_8",
+        "status": "completed"
+      },
+      {
+        "agent": "main",
+        "entryId": "5f4bc3ff",
+        "at": "2026-11-06T02:28:21.279Z",
+        "label": "bg_9",
+        "status": "completed"
+      }
+    ]
+  },
+  "totals": {
+    "files": 9,
+    "bytes": 5604157
+  },
+  "omitted": []
+}

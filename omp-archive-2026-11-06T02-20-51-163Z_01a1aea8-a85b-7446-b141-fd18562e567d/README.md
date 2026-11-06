@@ -1,6 +1,6 @@
 # Session archive
 
-Generated 2026-10-09T06:05:46.995Z from session `01a0ea19-2903-76e9-8058-f6c2eab80f3a`.
+Generated 2026-11-06T03:02:16.498Z from session `01a1aea8-a85b-7446-b141-fd18562e567d`.
 
 ## Layout
 
@@ -20,7 +20,7 @@ tool and background-job output, and `*.jsonl.tombstone` kill markers.
 
 ## Background jobs
 
-3 completed jobs recovered from the transcripts (main + every subagent); full list in `jobs.json`. A live snapshot of running/recent jobs for Main is also included. Per-job output lives in the owning transcript and in `artifacts/*.log`.
+2 completed jobs recovered from the transcripts (main + every subagent); full list in `jobs.json`. A live snapshot of running/recent jobs for Main is also included. Per-job output lives in the owning transcript and in `artifacts/*.log`.
 
 ## Subagents (0)
 
@@ -28,4 +28,4 @@ _No subagent sessions were recorded for this session._
 
 ## Totals
 
-6 files, 7577335 bytes.
+9 files, 5604157 bytes.
