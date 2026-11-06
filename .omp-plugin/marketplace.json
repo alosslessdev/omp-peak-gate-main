@@ -6,14 +6,14 @@
   },
   "metadata": {
     "description": "Cost-control plugins for oh-my-pi",
-    "version": "0.2.0"
+    "version": "0.3.0"
   },
   "plugins": [
     {
       "name": "peak-gate",
       "source": "./",
-      "description": "Gate remote DeepSeek LLM calls during DeepSeek's peak-pricing windows (Mon-Fri 01:00-04:00 and 06:00-10:00 UTC); local models never gated, opt-in fallback via retry.fallbackChains",
-      "version": "0.2.0",
+      "description": "Gate remote DeepSeek LLM calls during DeepSeek peak-pricing windows, with opt-in fallback via retry.fallbackChains and automatic session resume",
+      "version": "0.3.0",
       "category": "productivity",
       "keywords": ["deepseek", "cost", "peak", "pause", "fallback"]
     }
