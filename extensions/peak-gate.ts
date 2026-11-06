@@ -43,6 +43,29 @@
  * timer engages/releases at the boundary; a slow heartbeat re-derives state in
  * case the process slept through the edge or the model changed.
  *
+ * Resume coverage. The gate only wakes loops that are still parked. A run can
+ * end while the gate holds it — a host/deadline abort, a `wait` that timed
+ * out, or a process that died mid-park — and then nothing exists to wake when
+ * the gate opens. For a main session the plugin therefore:
+ *   - watches gate transitions itself instead of assuming its own hold is the
+ *     only holder,
+ *   - remembers that the run saw a pause, and on gate release injects one
+ *     continuation prompt when the session is idle with no pending async work
+ *     (a live loop that woke on its own makes this a no-op),
+ *   - drains steer/follow-up messages queued while an idle session was paused,
+ *   - interrupts an in-flight `wait` with an `aside` after a real hold, since a
+ *     wait ignores the gate and would otherwise keep the turn blocked,
+ *   - persists a per-session marker so a resumed session after a hard process
+ *     loss still gets one continuation prompt (cleared on graceful shutdown),
+ *   - distinguishes a deliberate user interrupt (never auto-resumed) from an
+ *     abort/deadline that the gate caused.
+ * Auto-resume is bounded per hold and can be disabled with
+ * `OMP_PEAK_GATE_RESUME=0`.
+ *
+ * Windows are a static weekly UTC table. There is deliberately no holiday
+ * calendar (for example the yearly, subjectively-set Chinese holiday dates):
+ * every weekday in the configured table is subject to the gate.
+ *
  * Config:
  *   - `~/.omp/agent/peak-gate.json`  optional override, `{ "windows": [...] }`
  *     where each window is `{ "startMinute": 60, "endMinute": 240,
@@ -54,6 +77,8 @@
  *   - `OMP_PEAK_GATE_KEEPALIVE=0`    let a parked headless run exit instead of
  *                                    holding the process open until the window closes.
  *   - `OMP_PEAK_GATE_DEBUG=/path`    append decision lines to a log file.
+ *   - `OMP_PEAK_GATE_RESUME=0`       disable auto-resume (prompt, wait interrupt,
+ *                                    restart marker).
  *   - fallback: `retry.fallbackChains` in omp settings (see above) — opt-in.
  *
  * Manual control: `/peak-gate status|pause|resume|reload`. A manual override
@@ -64,23 +89,43 @@
  * `disabledExtensions: [extension-module:peak-gate]`, `omp plugin disable`, or
  * `{ "enabled": false }` in the config file above.
  */
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { agentPauseGate, type ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { isUserInterruptAbort } from "@oh-my-pi/pi-coding-agent/session/messages";
 import {
 	findRetryFallbackCandidates,
 	formatRetryFallbackSelector,
 	getRetryFallbackChains,
 	resolveRetryFallbackChainKey,
 } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
-import type { Model } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 
 const DAY_MS = 86_400_000;
 const MINUTE_MS = 60_000;
-const CONFIG_PATH = `${process.env.PI_CODING_AGENT_DIR ?? `${process.env.HOME}/.omp/agent`}/peak-gate.json`;
+const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? `${process.env.HOME}/.omp/agent`;
+const CONFIG_PATH = `${AGENT_DIR}/peak-gate.json`;
+const RESUME_MARKER_PATH = `${AGENT_DIR}/peak-gate-resume.json`;
 const HEARTBEAT_MS = 30_000;
 const NOTIFY_COOLDOWN_MS = 60_000;
 const WEEKDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
+
+/** Let a woken loop prove it is running before injecting a continuation prompt. */
+const RESUME_GRACE_MS = 400;
+/** A gate hold shorter than this is a fallback switch or a transient blip, not a park. */
+const WAIT_INTERRUPT_MIN_HOLD_MS = 5_000;
+/** Give an in-flight `wait` a moment to settle on its own before interrupting it. */
+const WAIT_INTERRUPT_DELAY_MS = 1_500;
+/** Do not auto-continue the same session more than this many times per hold. */
+const MAX_RESUMES_PER_HOLD = 2;
+/** Ignore resume markers older than this; a stale prompt is worse than a stall. */
+const RESUME_MARKER_TTL_MS = 24 * 60 * 60_000;
+/** Prompt injected when the session settled while the gate was holding it. */
+const RESUME_PROMPT =
+	"The peak-gate pause that interrupted this session has ended. Continue the task from where it stopped; do not repeat completed work. Background jobs and queued messages are still available.";
+/** Delivery that ends an in-flight `wait` so the loop returns to the model. */
+const WAIT_RESUME_PROMPT =
+	"The peak-gate pause is over. Resume the task now. If you were waiting on background work, do not block on it again: read proc:// for its status and continue with the next step.";
 
 /**
  * Provider ids that execute on the local machine even when their baseUrl is
@@ -301,6 +346,79 @@ function loadWindows(): { windows: readonly PeakWindow[]; enabled: boolean; sour
 	return { windows, enabled, source };
 }
 
+/** Auto-resume is on unless explicitly disabled at process start. */
+const RESUME_ENABLED = process.env.OMP_PEAK_GATE_RESUME !== "0";
+
+/** Durable hint that a main session had work in flight when the gate parked it. */
+interface ResumeMarker {
+	sessionId: string;
+	at: number;
+	cwd?: string;
+}
+
+function readResumeMarker(): ResumeMarker | undefined {
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(RESUME_MARKER_PATH, "utf8"));
+		if (typeof parsed !== "object" || parsed === null) return undefined;
+		const sessionId = "sessionId" in parsed ? parsed.sessionId : undefined;
+		const at = "at" in parsed ? parsed.at : undefined;
+		if (typeof sessionId !== "string" || typeof at !== "number" || !Number.isFinite(at)) return undefined;
+		if (Date.now() - at > RESUME_MARKER_TTL_MS) return undefined;
+		const cwd = "cwd" in parsed && typeof parsed.cwd === "string" ? parsed.cwd : undefined;
+		return { sessionId, at, cwd };
+	} catch {
+		return undefined;
+	}
+}
+
+function writeResumeMarker(sessionId: string, cwd: string): void {
+	if (!RESUME_ENABLED) return;
+	try {
+		const marker: ResumeMarker = { sessionId, cwd, at: Date.now() };
+		writeFileSync(RESUME_MARKER_PATH, JSON.stringify(marker));
+	} catch (error) {
+		debug(`resume: could not write ${RESUME_MARKER_PATH}: ${String(error)}`);
+	}
+}
+
+function clearResumeMarker(): void {
+	try {
+		unlinkSync(RESUME_MARKER_PATH);
+	} catch {
+		// No marker (or no permission): nothing to clear.
+	}
+}
+
+/**
+ * Process-wide ownership of the pause gate. Every session's extension binding
+ * may want the gate closed, but only the binding that actually engaged it may
+ * release it. A plain boolean leaks the pause forever when one of several
+ * sessions (or an earlier binding of the same session) shuts down first.
+ */
+const gateWanters = new Set<symbol>();
+let gateOwnedByPeakGate = false;
+let gateMonitorAttached = false;
+
+function attachGateMonitor(): void {
+	if (gateMonitorAttached) return;
+	gateMonitorAttached = true;
+	agentPauseGate.onChange(paused => {
+		// The user's `/pause` toggle releases the gate directly; drop ownership
+		// so a later release cannot resume a pause that is no longer ours.
+		if (!paused) gateOwnedByPeakGate = false;
+	});
+}
+
+function syncPeakGate(): void {
+	attachGateMonitor();
+	if (gateWanters.size > 0) {
+		if (!agentPauseGate.paused && agentPauseGate.pause()) gateOwnedByPeakGate = true;
+	} else if (gateOwnedByPeakGate && agentPauseGate.paused) {
+		agentPauseGate.resume();
+		gateOwnedByPeakGate = false;
+	}
+}
+
 /**
  * Extension factory. `agentPauseGate` is a process-global singleton shared with
  * the TUI `/pause` command, main agents, in-process subagents, and advisors.
@@ -334,6 +452,32 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 	/** Set when a switch was attempted and refused this window; retried on reload/window end. */
 	let switchFailed = false;
 
+	/** This binding's membership in the process-wide gate want set. */
+	const gateToken = Symbol("peak-gate-session");
+	let wantsGate = false;
+	let disposed = false;
+	/** Context that created the timers currently armed (can differ after a switch). */
+	let timerCtx: ExtensionContext | undefined;
+	let unsubscribeGate: (() => void) | undefined;
+	let sessionId: string | undefined;
+	let sessionCwd: string | undefined;
+	let isMainSession = false;
+	/** A run is live; it may be parked on the gate. */
+	let runActive = false;
+	/** The current run saw the gate closed at least once (parked or interrupted). */
+	let runSawPause = false;
+	let gateHeldAt: number | undefined;
+	let gateOpenedAt = 0;
+	let waitInterruptEligible = false;
+	let resumePending = false;
+	let resumeReason: string | undefined;
+	let resumeTimer: Timer | undefined;
+	let resumeRetries = 0;
+	let waitTimer: Timer | undefined;
+	let resumeAttempts = 0;
+	let activeWait: { id: string; startedAt: number } | undefined;
+	const interruptedWaits = new Set<string>();
+
 	/** Keep a parked headless process alive; release it with the gate. */
 	const holdProcess = (engaged: boolean): void => {
 		if (process.env.OMP_PEAK_GATE_KEEPALIVE === "0") return;
@@ -343,6 +487,259 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 			clearInterval(keepalive);
 			keepalive = undefined;
 		}
+	};
+
+	const setGateWant = (want: boolean): void => {
+		if (disposed) return;
+		if (want !== wantsGate) {
+			wantsGate = want;
+			if (want) gateWanters.add(gateToken);
+			else gateWanters.delete(gateToken);
+		}
+		// Sync even when the preference is unchanged: the user can release the
+		// shared gate at any moment and the next heartbeat must re-engage it.
+		syncPeakGate();
+	};
+
+	const writeMarkerIfMain = (): void => {
+		if (!RESUME_ENABLED || !isMainSession || sessionId === undefined || sessionCwd === undefined) return;
+		writeResumeMarker(sessionId, sessionCwd);
+	};
+
+	const cancelResumeTimer = (): void => {
+		if (resumeTimer === undefined) return;
+		try {
+			(timerCtx ?? context)?.clearTimer(resumeTimer);
+		} catch {
+			// The owning session may already be disposed.
+		}
+		resumeTimer = undefined;
+	};
+
+	const cancelWaitTimer = (): void => {
+		if (waitTimer === undefined) return;
+		try {
+			(timerCtx ?? context)?.clearTimer(waitTimer);
+		} catch {
+			// The owning session may already be disposed.
+		}
+		waitTimer = undefined;
+	};
+
+	/**
+	 * A run settled while the gate held it (deadline, provider abort, or a host
+	 * timeout that expired during the pause). The gate itself can only wake
+	 * loops that are still parked, so once the session is idle the only way
+	 * back is a fresh prompt. Waits for a short grace so a loop that woke on
+	 * `resume()` can prove it is running and make this a no-op.
+	 */
+	const attemptResume = (): void => {
+		const c = context;
+		if (!RESUME_ENABLED || disposed || !isMainSession || !resumePending || c === undefined) return;
+		debug(`resume: attempt (idle=${c.isIdle()} runActive=${runActive} retry=${resumeRetries})`);
+		if (agentPauseGate.paused) {
+			// Re-paused before the check ran; `handleGateOpened` re-arms it.
+			holdProcess(true);
+			return;
+		}
+		if (!c.isIdle()) {
+			if (runActive) {
+				// A fresh run is live (usually the parked loop woke); it owns the
+				// session now. A `wait` that was already running is the one case
+				// the gate cannot unblock, so end it and let the model continue.
+				resumePending = false;
+				resumeReason = undefined;
+				clearResumeMarker();
+				if (
+					waitInterruptEligible &&
+					activeWait !== undefined &&
+					activeWait.startedAt <= gateOpenedAt
+				) {
+					scheduleWaitInterrupt(activeWait.id);
+				}
+				holdProcess(wantsGate);
+				return;
+			}
+			// A restored session can still be initializing when the first check
+			// lands (TUI load, large session file). Retry briefly instead of
+			// waiting for the 30s heartbeat.
+			if (resumeRetries < 20) {
+				resumeRetries++;
+				debug(`resume: session not idle yet; retrying in 500ms (${resumeRetries}/20)`);
+				resumeTimer = c.setTimeout(() => {
+					resumeTimer = undefined;
+					attemptResume();
+				}, 500);
+				holdProcess(true);
+				return;
+			}
+			holdProcess(wantsGate);
+			return;
+		}
+		if (c.getAsyncJobSnapshot?.()?.running?.length) {
+			// Background results auto-deliver and start the next turn themselves.
+			holdProcess(wantsGate);
+			return;
+		}
+		if (resumeAttempts >= MAX_RESUMES_PER_HOLD) {
+			debug(`resume: giving up after ${resumeAttempts} attempts (${resumeReason ?? "unknown"})`);
+			resumePending = false;
+			resumeReason = undefined;
+			clearResumeMarker();
+			holdProcess(wantsGate);
+			return;
+		}
+		resumeAttempts++;
+		const reason = resumeReason ?? "gate-released";
+		try {
+			pi.sendUserMessage(RESUME_PROMPT, { attribution: "agent" });
+		} catch (error) {
+			debug(`resume: sendUserMessage failed: ${String(error)}`);
+			c.ui.notify(`Peak gate: could not auto-resume the session (${String(error)})`, "warning");
+			resumePending = false;
+			resumeReason = undefined;
+			holdProcess(wantsGate);
+			return;
+		}
+		debug(`resume: injected a continuation prompt (${reason}, attempt ${resumeAttempts})`);
+		c.ui.notify("Peak gate released: resuming the interrupted turn", "info");
+		resumePending = false;
+		resumeReason = undefined;
+		clearResumeMarker();
+		holdProcess(wantsGate);
+	};
+
+	const scheduleResumeCheck = (reason: string): void => {
+		if (!RESUME_ENABLED || disposed || !isMainSession || context === undefined) return;
+		if (!resumePending) resumeRetries = 0;
+		resumePending = true;
+		resumeReason = reason;
+		if (resumeTimer !== undefined) return;
+		const c = context;
+		resumeTimer = c.setTimeout(() => {
+			resumeTimer = undefined;
+			attemptResume();
+		}, RESUME_GRACE_MS);
+		// A headless run may settle the moment the gate opens; keep it alive
+		// until the continuation prompt has actually been injected.
+		holdProcess(true);
+	};
+
+	const scheduleWaitInterrupt = (waitId: string): void => {
+		if (
+			!RESUME_ENABLED ||
+			disposed ||
+			!isMainSession ||
+			waitTimer !== undefined ||
+			interruptedWaits.has(waitId) ||
+			context === undefined
+		) {
+			return;
+		}
+		const c = context;
+		waitTimer = c.setTimeout(() => {
+			waitTimer = undefined;
+			const still = context;
+			if (disposed || still === undefined || agentPauseGate.paused) return;
+			if (activeWait?.id !== waitId || interruptedWaits.has(waitId)) return;
+			if (still.isIdle()) {
+				scheduleResumeCheck("wait-ended");
+				return;
+			}
+			if (still.hasPendingMessages()) return; // the queued steer already cuts the wait
+			interruptedWaits.add(waitId);
+			try {
+				pi.sendUserMessage(WAIT_RESUME_PROMPT, { deliverAs: "aside", attribution: "agent" });
+			} catch (error) {
+				debug(`resume: wait interrupt failed: ${String(error)}`);
+				return;
+			}
+			debug("resume: interrupted an in-flight wait after gate release");
+			still.ui.notify("Peak gate released: interrupting the pending wait so the turn continues", "info");
+		}, WAIT_INTERRUPT_DELAY_MS);
+	};
+
+	const handleGateClosed = (): void => {
+		if (disposed || !isMainSession) return;
+		debug(`gate: closed (run=${runActive} queued=${context?.hasPendingMessages() ?? false})`);
+		gateHeldAt ??= Date.now();
+		waitInterruptEligible = false;
+		resumeAttempts = 0;
+		if (runActive) {
+			runSawPause = true;
+			writeMarkerIfMain();
+		}
+		if (context?.hasPendingMessages()) writeMarkerIfMain();
+	};
+
+	const handleGateOpened = (): void => {
+		if (disposed || !isMainSession || context === undefined) return;
+		const now = Date.now();
+		const heldFor = gateHeldAt === undefined ? 0 : now - gateHeldAt;
+		debug(
+			`gate: opened (held=${heldFor}ms run=${runActive} idle=${context.isIdle()} queued=${context.hasPendingMessages()} pendingResume=${resumePending})`,
+		);
+		gateHeldAt = undefined;
+		gateOpenedAt = now;
+		waitInterruptEligible = heldFor >= WAIT_INTERRUPT_MIN_HOLD_MS;
+		const c = context;
+
+		if (resumePending) {
+			scheduleResumeCheck(resumeReason ?? "gate-released");
+			return;
+		}
+		if (c.isIdle() && c.hasPendingMessages()) {
+			// A steer/follow-up queued while idle never starts a turn on its own —
+			// whether it was queued before or after the gate closed.
+			scheduleResumeCheck("queued-work");
+			return;
+		}
+		if (runActive && !c.isIdle()) {
+			// The parked loop woke and owns the session; a stale marker must not
+			// fire later. A pre-existing `wait` may still hold the turn hostage.
+			clearResumeMarker();
+			if (
+				waitInterruptEligible &&
+				activeWait !== undefined &&
+				activeWait.startedAt <= gateOpenedAt
+			) {
+				scheduleWaitInterrupt(activeWait.id);
+			}
+			return;
+		}
+		if (c.isIdle()) clearResumeMarker();
+	};
+
+	const initSession = (ctx: ExtensionContext): void => {
+		context = ctx;
+		sessionId = ctx.sessionManager.getSessionId();
+		// The session's recorded cwd, not the process cwd: resuming from another
+		// directory must still match the marker written by the original run.
+		sessionCwd = ctx.sessionManager.getCwd?.() ?? ctx.cwd;
+		isMainSession = ctx.agent?.kind === "main";
+		runActive = false;
+		runSawPause = false;
+		gateHeldAt = agentPauseGate.paused ? Date.now() : undefined;
+		waitInterruptEligible = false;
+		resumePending = false;
+		resumeReason = undefined;
+		resumeRetries = 0;
+		resumeAttempts = 0;
+		activeWait = undefined;
+		interruptedWaits.clear();
+		cancelResumeTimer();
+		cancelWaitTimer();
+		if (!isMainSession || !RESUME_ENABLED) return;
+		const marker = readResumeMarker();
+		if (marker === undefined) return;
+		if (marker.sessionId !== sessionId) return;
+		if (marker.cwd !== undefined && marker.cwd !== sessionCwd) return;
+		resumePending = true;
+		resumeReason = "restart";
+		debug(
+			`resume: marker for session ${sessionId} (age ${Math.round((Date.now() - marker.at) / 1000)}s)`,
+		);
+		if (!agentPauseGate.paused) scheduleResumeCheck("restart");
 	};
 
 	/**
@@ -467,6 +864,7 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 
 	/** Reconcile the gate with the clock and the session model. Idempotent. */
 	const apply = (now: number): void => {
+		if (disposed) return;
 		const inWindow = enabled && (manual === "pause" ? true : manual === "resume" ? false : isPeak(windows, now));
 		const model = context?.model;
 		const gated = model !== undefined && isGatedModel(model);
@@ -477,16 +875,14 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 
 		const want = inWindow && (manual === "pause" || gated);
 		const wasHolding = holding;
-		if (want && !agentPauseGate.paused) {
-			// pause() reports false when someone else (the user, /pause) holds it.
-			holding = agentPauseGate.pause();
-		} else if (!want && holding && agentPauseGate.paused) {
-			agentPauseGate.resume();
-			holding = false;
-		} else if (!want) {
-			holding = false;
-		}
-		holdProcess(holding);
+		setGateWant(want);
+		// Any session's claim keeps the process-wide gate closed; report the
+		// shared state rather than only this binding's preference.
+		holding = gateWanters.size > 0 && agentPauseGate.paused;
+		holdProcess(holding || resumePending);
+		// A run may have settled outside a pause transition (for example a
+		// provider abort right after the gate opened); the heartbeat catches it.
+		if (!agentPauseGate.paused && resumePending) scheduleResumeCheck(resumeReason ?? "gate-released");
 
 		// While gated inside a window, hand off to the configured fallback model.
 		if (inWindow && manual !== "pause" && gated && switched === undefined) startFallback(model as Model);
@@ -533,8 +929,24 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 	/** Arm the precise edge timer plus the heartbeat re-derivation. */
 	const arm = (ctx: ExtensionContext): void => {
 		context = ctx;
-		if (edgeTimer) ctx.clearTimer(edgeTimer);
-		if (heartbeat) ctx.clearTimer(heartbeat);
+		const clearCtx = timerCtx ?? ctx;
+		if (edgeTimer) {
+			try {
+				clearCtx.clearTimer(edgeTimer);
+			} catch {
+				// A prior session may already be disposed.
+			}
+		}
+		if (heartbeat) {
+			try {
+				clearCtx.clearTimer(heartbeat);
+			} catch {
+				// A prior session may already be disposed.
+			}
+		}
+		edgeTimer = undefined;
+		heartbeat = undefined;
+		timerCtx = ctx;
 		const schedule = (): void => {
 			const now = Date.now();
 			const next = nextTransition(windows, now);
@@ -555,11 +967,123 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 		apply(Date.now());
 	};
 
-	pi.on("session_start", (_event, ctx) => arm(ctx));
-	pi.on("session_shutdown", () => holdProcess(false));
+	pi.on("session_start", (_event, ctx) => {
+		initSession(ctx);
+		arm(ctx);
+	});
+	pi.on("session_switch", (_event, ctx) => {
+		initSession(ctx);
+		arm(ctx);
+	});
+	pi.on("session_shutdown", () => {
+		disposed = true;
+		cancelResumeTimer();
+		cancelWaitTimer();
+		const clearCtx = timerCtx;
+		if (edgeTimer !== undefined) {
+			try {
+				clearCtx?.clearTimer(edgeTimer);
+			} catch {
+				// Already disposed.
+			}
+			edgeTimer = undefined;
+		}
+		if (heartbeat !== undefined) {
+			try {
+				clearCtx?.clearTimer(heartbeat);
+			} catch {
+				// Already disposed.
+			}
+			heartbeat = undefined;
+		}
+		// A host timeout can abort the parked run and dispose the session before
+		// the gate ever opens. Keep the marker for that case; an ordinary quit
+		// (no pending resume) drops it so a later resume does not surprise anyone.
+		if (isMainSession && !resumePending) clearResumeMarker();
+		unsubscribeGate?.();
+		unsubscribeGate = undefined;
+		if (wantsGate) {
+			wantsGate = false;
+			gateWanters.delete(gateToken);
+		}
+		syncPeakGate();
+		holdProcess(false);
+		context = undefined;
+	});
+
+	unsubscribeGate = agentPauseGate.onChange(paused => {
+		if (paused) handleGateClosed();
+		else handleGateOpened();
+	});
+
 	// Re-derive at run start so a model change (or a window that opened while
 	// idle) takes effect on the next call instead of waiting out the heartbeat.
-	pi.on("agent_start", () => apply(Date.now()));
+	pi.on("agent_start", (_event, ctx) => {
+		if (disposed) return;
+		const wasPending = resumePending;
+		runActive = true;
+		runSawPause = agentPauseGate.paused;
+		resumePending = false;
+		resumeReason = undefined;
+		resumeRetries = 0;
+		cancelResumeTimer();
+		cancelWaitTimer();
+		// Only the main session owns the marker; a subagent starting a run must
+		// not erase the main session's pending restart hint.
+		if (isMainSession) clearResumeMarker();
+		if (agentPauseGate.paused) {
+			gateHeldAt ??= Date.now();
+			writeMarkerIfMain();
+		}
+		debug(`agent_start: main=${isMainSession} gate=${agentPauseGate.paused} wasPendingResume=${wasPending}`);
+		apply(Date.now());
+	});
+
+	pi.on("agent_end", (event, ctx) => {
+		if (disposed) return;
+		runActive = false;
+		if (!isMainSession) return;
+		const last = event.messages.findLast(
+			(message): message is AssistantMessage => message.role === "assistant",
+		);
+		const aborted = last?.stopReason === "aborted";
+		const userAbort = aborted && last !== undefined && isUserInterruptAbort(last);
+		const automatic = event.willContinue === true || event.awaitingAsyncWork === true;
+		debug(
+			`agent_end: aborted=${aborted} userAbort=${userAbort} automatic=${automatic} pauseSeen=${runSawPause} idle=${ctx.isIdle()} pending=${ctx.hasPendingMessages()}`,
+		);
+		if (aborted && !userAbort && !automatic && runSawPause) {
+			// A deadline, provider abort, or host timeout expired while the run
+			// was parked. No loop remains to wake when the gate opens.
+			writeMarkerIfMain();
+			scheduleResumeCheck("aborted-run");
+		} else if (userAbort || automatic) {
+			resumePending = false;
+			resumeReason = undefined;
+			cancelResumeTimer();
+			clearResumeMarker();
+		} else if (!ctx.hasPendingMessages()) {
+			clearResumeMarker();
+		}
+		runSawPause = false;
+	});
+
+	pi.on("tool_execution_start", event => {
+		if (event.toolName === "wait") activeWait = { id: event.toolCallId, startedAt: Date.now() };
+	});
+	pi.on("tool_execution_end", event => {
+		if (activeWait?.id === event.toolCallId) activeWait = undefined;
+		interruptedWaits.delete(event.toolCallId);
+	});
+
+	// Cache warming replays a real request outside the agent loop. It cannot be
+	// parked, so stop it for the duration of a hold instead of billing a warm
+	// request at peak rates. The warmer resumes on the next real request.
+	pi.on("cache_warming_decision", () => {
+		if (!enabled || !shouldPause(Date.now())) return;
+		debug("cache warming: stopped during a peak-gate hold");
+		return { action: "stop" as const };
+	});
 
 	// Advisory slip detector. The gate parks every agent loop before its model
 	// call, so a request that reaches this hook while the gate should be closed
@@ -634,6 +1158,14 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 							`fallback: ${fallbackLine}`,
 							`now: ${isPeak(windows, now) ? "PEAK window" : "off-peak"}${shouldPause(now) ? " - LLM calls paused" : ""}`,
 							`gate: ${agentPauseGate.paused ? (holding ? "engaged by peak-gate" : "engaged elsewhere (/pause)") : "open"}`,
+							`run: ${runActive ? (runSawPause ? "live (pause observed)" : "live") : "idle"}${activeWait === undefined ? "" : " - wait tool active"}`,
+							`resume: ${
+								!RESUME_ENABLED
+									? "disabled (OMP_PEAK_GATE_RESUME=0)"
+									: resumePending
+										? `armed: ${resumeReason ?? "pending"}`
+										: "watching"
+							}`,
 							`next boundary: ${next === undefined ? "none" : utcLabel(next)}`,
 						].join("\n"),
 						"info",
