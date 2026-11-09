@@ -70,13 +70,13 @@ active, and whether a resume is armed.
 omp plugin link /path/to/omp-peak-gate
 
 # git
-omp plugin install github:<user>/omp-peak-gate
+omp plugin install github:alosslessdev/omp-peak-gate-main
 
 # marketplace (this repo ships .omp-plugin/marketplace.json)
-/marketplace add <user>/omp-peak-gate
+/marketplace add alosslessdev/omp-peak-gate-main
 /marketplace install peak-gate@omp-peak-gate
 
-# npm (after publishing)
+# npm
 omp plugin install omp-peak-gate
 ```
 
