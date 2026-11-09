@@ -3,7 +3,21 @@
   "version": "0.3.0",
   "description": "Gate remote DeepSeek LLM calls during DeepSeek peak-pricing windows, with opt-in fallback via retry.fallbackChains and automatic session resume",
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alosslessdev/omp-peak-gate-main.git"
+  },
+  "homepage": "https://github.com/alosslessdev/omp-peak-gate-main#readme",
+  "bugs": {
+    "url": "https://github.com/alosslessdev/omp-peak-gate-main/issues"
+  },
   "keywords": ["omp", "oh-my-pi", "plugin", "extension", "deepseek", "cost", "peak", "pause", "fallback"],
+  "files": [
+    "extensions/",
+    "README.md",
+    "LICENSE"
+  ],
   "omp": {
     "description": "Gate remote DeepSeek LLM calls during DeepSeek peak-pricing windows, with opt-in fallback via retry.fallbackChains and automatic session resume",
     "extensions": ["./extensions/peak-gate.ts"]
