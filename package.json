@@ -1,6 +1,6 @@
 {
   "name": "omp-peak-gate",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Gate remote DeepSeek LLM calls during DeepSeek peak-pricing windows, with opt-in fallback via retry.fallbackChains and automatic session resume",
   "type": "module",
   "license": "MIT",
@@ -16,6 +16,7 @@
   "files": [
     "extensions/",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "omp": {

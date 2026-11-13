@@ -266,6 +266,9 @@ beforeEach(() => {
 afterEach(async () => {
 	for (const harness of activeHarnesses) {
 		try {
+			// The manual override is process-wide now; `/peak-gate reload` clears it
+			// so one test's pause/resume cannot leak into the next.
+			await harness.command("reload");
 			await harness.emit("session_shutdown");
 		} catch {}
 	}
@@ -446,7 +449,7 @@ describe("side channels", () => {
 });
 
 describe("process-wide gate ownership", () => {
-	test("one session releasing does not open a gate another session still wants", async () => {
+	test("an explicit resume releases the gate for every session", async () => {
 		const first = await boot({ sessionId: "session-a", idle: true });
 		const second = await boot({ sessionId: "session-b", idle: true });
 		await first.command("pause");
@@ -454,7 +457,7 @@ describe("process-wide gate ownership", () => {
 		expect(gate.paused).toBe(true);
 
 		await first.command("resume");
-		expect(gate.paused).toBe(true);
+		expect(gate.paused).toBe(false);
 
 		await second.command("resume");
 		expect(gate.paused).toBe(false);
@@ -469,6 +472,61 @@ describe("process-wide gate ownership", () => {
 		expect(gate.paused).toBe(true);
 		await second.emit("session_shutdown");
 		expect(gate.paused).toBe(false);
+	});
+});
+
+describe("manual override across sessions", () => {
+	/** Run `fn` with an explicit window table; the next binding reads it on load. */
+	async function withWindows<K>(windows: string, fn: () => Promise<K>): Promise<K> {
+		const previous = process.env.OMP_PEAK_GATE_WINDOWS;
+		process.env.OMP_PEAK_GATE_WINDOWS = windows;
+		try {
+			return await fn();
+		} finally {
+			if (previous === undefined) delete process.env.OMP_PEAK_GATE_WINDOWS;
+			else process.env.OMP_PEAK_GATE_WINDOWS = previous;
+		}
+	}
+
+	test("a subagent session starting after /peak-gate resume does not re-pause the gate", async () => {
+		const allDay = JSON.stringify([{ startMinute: 0, endMinute: 1440 }]);
+		await withWindows(allDay, async () => {
+			const main = await boot({ sessionId: "main-manual", idle: true });
+			expect(gate.paused).toBe(true);
+
+			await main.command("resume");
+			expect(gate.paused).toBe(false);
+
+			// Spawning a subagent creates another binding whose model + window
+			// would make it want the shared gate closed.
+			const sub = await boot({ sessionId: "sub-manual", kind: "sub", idle: true });
+			expect(gate.paused).toBe(false);
+
+			// Heartbeats re-derive state; the override must still win.
+			sub.scheduler.advance(31_000);
+			expect(gate.paused).toBe(false);
+		});
+	});
+
+	test("a manual resume expires at the next window boundary", async () => {
+		// The fake clock is 2023-11-14T22:13:20Z: Tuesday, minute 1333.
+		const edges = JSON.stringify([
+			{ startMinute: 0, endMinute: 1334, weekdays: [2] },
+			{ startMinute: 1335, endMinute: 1440, weekdays: [2] },
+		]);
+		await withWindows(edges, async () => {
+			const h = await boot({ sessionId: "main-boundary", idle: true });
+			expect(gate.paused).toBe(true);
+
+			await h.command("resume");
+			expect(gate.paused).toBe(false);
+
+			h.scheduler.advance(60_000); // out of the first window
+			expect(gate.paused).toBe(false);
+
+			h.scheduler.advance(60_000); // inside the next one: the gate returns
+			expect(gate.paused).toBe(true);
+		});
 	});
 });
 

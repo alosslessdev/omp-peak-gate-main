@@ -56,6 +56,7 @@ covers the omp edge cases around that:
 | Process died mid-park, or a host deadline (`--max-time`) disposed the session before the gate opened | A per-session marker (`~/.omp/agent/peak-gate-resume.json`, 24h TTL) causes one continuation prompt when that session is next resumed. Cleared on an ordinary graceful shutdown, kept when a resume is pending. |
 | User pressed Esc / deliberately interrupted | Never auto-resumed; a user-interrupt abort is distinguished from a host/deadline abort. |
 | Fallback model took over | The gate only pauses briefly (or not at all); no resume prompt is generated. |
+| `/peak-gate resume` while subagents are running or about to spawn | The override is process-wide: every live binding re-derives at once, and a subagent session created afterwards does not re-pause the gate from its own window. It expires at the next boundary. |
 
 Auto-resume is bounded to two injections per hold, never runs in subagent
 sessions, and can be disabled entirely with `OMP_PEAK_GATE_RESUME=0`. The
@@ -90,14 +91,20 @@ load, and the gate would be registered twice.
 | Command                                  | Effect                                                   |
 | ---------------------------------------- | -------------------------------------------------------- |
 | `/peak-gate`                             | Show state, windows, model scope, fallback, next boundary |
-| `/peak-gate pause`                       | Hold LLM calls paused until the next window boundary      |
-| `/peak-gate resume`                      | Release now, skip the current window (restore a fallback) |
+| `/peak-gate pause`                       | Hold every session in the process paused until the next window boundary |
+| `/peak-gate resume`                      | Release every session now, skip the current window (restore a fallback) |
 | `/peak-gate reload`                      | Re-read the config file and re-arm the timers             |
 
 While the gate is held, the status line shows `⏸ peak-gate until <UTC>`; while
 running on a fallback model it shows `⏸ peak-gate ↓<model> until <UTC>`.
 `pause` pauses every model regardless of scope; `resume` releases the gate and
 switches back to the original DeepSeek model if a fallback was applied.
+
+Both overrides are **process-wide**, because the gate is shared by main,
+subagent and advisor sessions. A session created after `/peak-gate resume` — for
+example a subagent spawned by the next turn — must not re-derive `want = true`
+from the window and re-pause the gate the user just released. The override is
+re-derived in every live session and expires at the next window boundary.
 
 ## Configuration
 

@@ -20,8 +20,8 @@
  * checkpoints running locally (Ollama, llama.cpp, LM Studio, … — loopback
  * baseUrl or a known local provider id) are never gated: they are not billed
  * at DeepSeek's peak rates. Any other model (Claude, GPT, local models) is
- * never gated either. `manual === "pause"` (`/peak-gate pause`) still pauses
- * everything regardless of model.
+ * never gated either. `/peak-gate pause` still pauses everything regardless of
+ * model.
  *
  * Fallback (opt-in): if the model IS gated and oh-my-pi has a fallback chain
  * configured for it (`retry.fallbackChains` in omp settings — the same chain
@@ -82,7 +82,10 @@
  *   - fallback: `retry.fallbackChains` in omp settings (see above) — opt-in.
  *
  * Manual control: `/peak-gate status|pause|resume|reload`. A manual override
- * lasts until the next window boundary.
+ * belongs to the process, not to the calling session, because the gate is
+ * shared by main, subagent and advisor sessions: `/peak-gate resume` must not
+ * be undone when another session (or a subagent spawned next) re-derives its
+ * own want from the window. It lasts until the next window boundary.
  *
  * Shipped as the `omp-peak-gate` plugin (`package.json#omp.extensions`); the
  * extension-module id is `peak-gate`. Disable with
@@ -399,6 +402,28 @@ const gateWanters = new Set<symbol>();
 let gateOwnedByPeakGate = false;
 let gateMonitorAttached = false;
 
+/**
+ * Manual `/peak-gate pause|resume` override. The gate is shared by every
+ * session in the process, so the override must be too: keeping it per binding
+ * let a subagent session created after `/peak-gate resume` re-derive
+ * `want = true` from the window and re-pause the gate the user just released.
+ * The override belongs to the process and expires at the next window boundary.
+ */
+let manualOverride: "pause" | "resume" | undefined;
+
+/** Live session bindings, so an override change re-derives every session at once. */
+const gateBindings = new Set<() => void>();
+
+function reapplyAll(): void {
+	for (const reapply of gateBindings) {
+		try {
+			reapply();
+		} catch {
+			// A disposed or half-initialized session must not break the sweep.
+		}
+	}
+}
+
 function attachGateMonitor(): void {
 	if (gateMonitorAttached) return;
 	gateMonitorAttached = true;
@@ -430,8 +455,6 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 	const quiet = process.env.OMP_PEAK_GATE_QUIET === "1";
 	/** True only while this extension is the one holding the gate. */
 	let holding = false;
-	/** Manual override applied until the next window boundary. */
-	let manual: "pause" | "resume" | undefined;
 	let context: ExtensionContext | undefined;
 	let edgeTimer: Timer | undefined;
 	let heartbeat: Timer | undefined;
@@ -456,6 +479,10 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 	const gateToken = Symbol("peak-gate-session");
 	let wantsGate = false;
 	let disposed = false;
+	/** Re-derive this session when the process-wide manual override changes. */
+	const reapply = (): void => {
+		if (!disposed) apply(Date.now());
+	};
 	/** Context that created the timers currently armed (can differ after a switch). */
 	let timerCtx: ExtensionContext | undefined;
 	let unsubscribeGate: (() => void) | undefined;
@@ -712,6 +739,7 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 
 	const initSession = (ctx: ExtensionContext): void => {
 		context = ctx;
+		gateBindings.add(reapply);
 		sessionId = ctx.sessionManager.getSessionId();
 		// The session's recorded cwd, not the process cwd: resuming from another
 		// directory must still match the marker written by the original run.
@@ -855,8 +883,8 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 	/** Pause decision for a point in time: clock, manual override, session model. */
 	const shouldPause = (now: number): boolean => {
 		if (!enabled) return false;
-		if (manual === "pause") return true;
-		if (manual === "resume") return false;
+		if (manualOverride === "pause") return true;
+		if (manualOverride === "resume") return false;
 		if (!isPeak(windows, now)) return false;
 		const model = context?.model;
 		return model !== undefined && isGatedModel(model);
@@ -865,7 +893,8 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 	/** Reconcile the gate with the clock and the session model. Idempotent. */
 	const apply = (now: number): void => {
 		if (disposed) return;
-		const inWindow = enabled && (manual === "pause" ? true : manual === "resume" ? false : isPeak(windows, now));
+		const inWindow =
+			enabled && (manualOverride === "pause" ? true : manualOverride === "resume" ? false : isPeak(windows, now));
 		const model = context?.model;
 		const gated = model !== undefined && isGatedModel(model);
 
@@ -873,7 +902,7 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 		// the gate decision below sees the restored DeepSeek model.
 		if (!inWindow && switched !== undefined) restoreIfSwitched();
 
-		const want = inWindow && (manual === "pause" || gated);
+		const want = inWindow && (manualOverride === "pause" || gated);
 		const wasHolding = holding;
 		setGateWant(want);
 		// Any session's claim keeps the process-wide gate closed; report the
@@ -885,7 +914,7 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 		if (!agentPauseGate.paused && resumePending) scheduleResumeCheck(resumeReason ?? "gate-released");
 
 		// While gated inside a window, hand off to the configured fallback model.
-		if (inWindow && manual !== "pause" && gated && switched === undefined) startFallback(model as Model);
+		if (inWindow && manualOverride !== "pause" && gated && switched === undefined) startFallback(model as Model);
 
 		const next = nextTransition(windows, now);
 		const until = next === undefined ? "" : ` until ${utcLabel(next)}`;
@@ -899,7 +928,7 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 		if (holding === wasHolding) return;
 		if (holding) {
 			const release = next === undefined ? "" : `; releases ${utcLabel(next)}`;
-			if (manual === "pause") {
+			if (manualOverride === "pause") {
 				context?.ui.notify(`Peak gate: LLM calls paused manually${release}`, "info");
 			} else {
 				const fallback = model !== undefined ? resolveFallbackTarget(model) : undefined;
@@ -915,7 +944,7 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 		} else if (switched === undefined) {
 			const why = !enabled
 				? "disabled"
-				: manual === "resume"
+				: manualOverride === "resume"
 					? "resumed manually"
 					: isPeak(windows, now)
 						? "no remote DeepSeek model active"
@@ -954,8 +983,8 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 				// +50ms so the timer lands just inside the new period, never 1ms early.
 				edgeTimer = ctx.setTimeout(() => {
 					debug("edge timer fired");
-					manual = undefined;
-					apply(Date.now());
+					manualOverride = undefined;
+					reapplyAll();
 					schedule();
 				}, Math.max(1, Math.min(next - now + 50, 7 * DAY_MS)));
 				debug(`armed edge timer for ${utcLabel(next)} (${Math.round((next - now) / 1000)}s)`);
@@ -977,6 +1006,7 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", () => {
 		disposed = true;
+		gateBindings.delete(reapply);
 		cancelResumeTimer();
 		cancelWaitTimer();
 		const clearCtx = timerCtx;
@@ -1112,22 +1142,23 @@ export default function deepseekPeakGate(pi: ExtensionAPI) {
 			const now = Date.now();
 			switch (action) {
 				case "pause":
-					manual = "pause";
-					apply(now);
+					manualOverride = "pause";
+					reapplyAll();
 					break;
 				case "resume":
-					manual = "resume";
-					apply(now);
-					ctx.ui.notify("Peak gate released until the next window boundary", "info");
+					manualOverride = "resume";
+					reapplyAll();
+					ctx.ui.notify("Peak gate released for every session until the next window boundary", "info");
 					break;
 				case "reload": {
 					const loaded = loadWindows();
 					windows = loaded.windows;
 					enabled = loaded.enabled;
 					source = loaded.source;
-					manual = undefined;
+					manualOverride = undefined;
 					switchFailed = false;
 					arm(ctx);
+					reapplyAll();
 					ctx.ui.notify(`Peak gate reloaded from ${source}: ${describeWindows(windows)}`, "info");
 					break;
 				}
